@@ -920,6 +920,7 @@ namespace TcpChatViewer
         }
     }
 }
+```
 
 如同发消息端一样，我们时候TcpClient的构造函数但不连接。我们在`Connect()`函数中连接。如果我们已经连接上了，我们立刻发送`viewer`的消息告诉服务器我们是谁，一个浏览端。如果我们仍然连接，我们就可以认定服务器把我们认作浏览端并且将会给我们发送消息。在这一点上，服务器已经给我们发送一个"Welcome to the 'SERVER_NAME' Chat Server" 但直到我们进入`ListenForMessages()`才会知道。
 
@@ -941,4 +942,3 @@ namespace TcpChatViewer
 3. 当从网络中读取消息的时候我们应该设置超时，现在`NetworkStream`在无限等待数据，可以查看[NetworkStream](https://msdn.microsoft.com/en-us/library/system.net.sockets.networkstream(v=vs.110).aspx)的超时相关属性。
 4. 将用户端拆分为两个（浏览端和发消息端）不是一个好的做法。对于那些只想要收听的人来说是很好的，但是对于那些想要发送和接受消息的人来说是一个麻烦。
 5. 任何现实中的网络应用程序应该使用`async`，多线程，超时机制，这里一个都没有。正常来说，当一个新的客户端连接进来的时候，服务器会开辟一个新的线程或者进程，这样的话，既可以处理新的连接也可以处理现有连接的客户端，我们在读和写`NetworkStream`应该也使用异步。
-
