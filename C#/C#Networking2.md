@@ -516,3 +516,435 @@ namespace TcpGames
 在转换帮助类之后，我们有`TcpClient`帮助类。`IsDisconnected()`在其他章节中描述过了，`CleanUpClient()`清除`TcpClient`的资源
 
 在类的结尾，我们有一些程序执行的代码。最后还有按Ctrl-C来关闭服务器的中断处理。
+
+### TCP Games - Guess My Number
+
+猜数字是一个很简单的游戏，只需要一个玩家。服务器会随机生成以一个1-100内的数字然后让客户端去猜。它会告诉客户端他们猜的大了还是小了。一旦用户猜对了，游戏将会通知服务器和用户断开连接。记得`Run()`方法是在一个额外线程中运行的。虽然服务器中的其他部分是异步多线程的，但这里，我们将会同步单线程的运行。
+
+```c#
+using System;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace TcpGames
+{
+    public class GuessMyNumberGame : IGame
+    {
+        // Objects for the game
+        private TcpGamesServer _server;
+        private TcpClient _player;
+        private Random _rng;
+        private bool _needToDisconnectClient = false;
+
+        // Name of the game
+        public string Name
+        {
+            get { return "Guess My Number"; }
+        }
+
+        // Just needs only one player
+        public int RequiredPlayers
+        {
+            get { return 1; }
+        }                
+                
+        // Constructor
+        public GuessMyNumberGame(TcpGamesServer server)
+        {
+            _server = server;
+            _rng = new Random();
+        }
+
+        // Adds only a single player to the game
+        public bool AddPlayer(TcpClient client)
+        {
+            // Make sure only one player was added
+            if (_player == null)
+            {
+                _player = client;
+                return true;
+            }
+
+            return false;
+        }
+
+        // If the client who disconnected is ours, we need to quit our game
+        public void DisconnectClient(TcpClient client)
+        {
+            _needToDisconnectClient = (client == _player);
+        }
+
+        // Main loop of the Game
+        // Packets are sent sent synchronously though
+        public void Run()
+        {
+            // Make sure we have a player
+            bool running = (_player != null);
+            if (running)
+            {
+                // Send a instruction packet
+                Packet introPacket = new Packet("message",
+                    "Welcome player, I want you to guess my number.\n" +
+                    "It's somewhere between (and including) 1 and 100.\n");
+                _server.SendPacket(_player, introPacket).GetAwaiter().GetResult();
+            }
+            else
+                return;
+
+            // Should be [1, 100]
+            int theNumber = _rng.Next(1, 101);
+            Console.WriteLine("Our number is: {0}", theNumber);
+
+            // Some bools for game state
+            bool correct = false;
+            bool clientConncted = true;
+            bool clientDisconnectedGracefully = false;
+
+            // Main game loop
+            while (running)
+            {
+                // Poll for input
+                Packet inputPacket = new Packet("input", "Your guess: ");
+                _server.SendPacket(_player, inputPacket).GetAwaiter().GetResult();
+
+                // Read their answer
+                Packet answerPacket = null;
+                while (answerPacket == null)
+                {
+                    answerPacket = _server.ReceivePacket(_player).GetAwaiter().GetResult();
+                    Thread.Sleep(10);
+                }
+
+                // Check for graceful disconnect
+                if (answerPacket.Command == "bye")
+                {
+                    _server.HandleDisconnectedClient(_player);
+                    clientDisconnectedGracefully = true;
+                }
+
+                // Check input
+                if (answerPacket.Command == "input")
+                {
+                    Packet responsePacket = new Packet("message");
+
+                    int theirGuess;
+                    if (int.TryParse(answerPacket.Message, out theirGuess))
+                    {
+
+                        // See if they won
+                        if (theirGuess == theNumber)
+                        {
+                            correct = true;
+                            responsePacket.Message = "Correct!  You win!\n";
+                        }
+                        else if (theirGuess < theNumber)
+                            responsePacket.Message = "Too low.\n";
+                        else if (theirGuess > theNumber)
+                            responsePacket.Message = "Too high.\n";
+                    }
+                    else
+                        responsePacket.Message = "That wasn't a valid number, try again.\n";
+
+                    // Send the message
+                    _server.SendPacket(_player, responsePacket).GetAwaiter().GetResult();
+                }
+
+                // Take a small nap
+                Thread.Sleep(10);
+
+                // If they aren't correct, keep them here
+                running &= !correct;
+
+                // Check for disconnect, may have happend gracefully before
+                if (!_needToDisconnectClient && !clientDisconnectedGracefully)
+                    clientConncted &= !TcpGamesServer.IsDisconnected(_player);
+                else
+                    clientConncted = false;
+                
+                running &= clientConncted;
+            }
+
+            // Thank the player and disconnect them
+            if (clientConncted)
+                _server.DisconnectClient(_player, "Thanks for playing \"Guess My Number\"!");
+            else
+                Console.WriteLine("Client disconnected from game.");
+
+            Console.WriteLine("Ending a \"{0}\" game.", Name);
+        }
+    }
+}
+```
+
+就像之前所说，它需要继承`IGame`接口，在开始我们存储了一个指向运行游戏的`TcpGameServer`的指针。通过这种方式，我们可以调用服务器的方法来传输`Packet`。我们可以简单地把我们的游戏称之为“猜数字”。`RequiredPlayers`只需要一个人。在我们构造器中，我们还需要初始化一个随机数生成器。
+
+`AddPlayer()`将会只接受一个玩家。如果有新玩家想要加入，我们会忽视掉他们并且返回`false`。
+
+`DisconnectClient()`是一个通知方法。防止我们现在需要断开一个现有玩家的连接（也就是退出游戏）。
+
+`Run()`方法直到有一个玩家才会开始游戏。如果我们开始了，我们会发送一个包含规则的`message Packet`。然后我们会生成随机数。在游戏主循环中我们给用户发送一个`input`的请求。由于`ReceivePacket()`可能会返回`null`。因此我们要保持监视循环直到得到回复。由于我们在处理客户端，游戏需要检查是否断开连接。如果是优雅的方式就先标记他。如果我们从我们的`input`请求中得到响应，我们会去检查他。在`input`的基础上，我们会检测对错然后在此基础上给他们发送消息。在游戏主循环的结尾我们会检测是否断开连接（无论是否优雅）。
+
+一旦客户端断开连接并且猜对了数字，我们会退出`Run()`方法，然后游戏就结束了。
+
+### TCP Games - Client
+
+现在最后一件要做的事情就是客户端的代码，记得将`Packet`加到客户端项目中。
+
+```c#
+using System;
+using System.Text;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Collections.Generic;
+
+namespace TcpGames
+{
+    public class TcpGamesClient
+    {
+        // Conneciton objects
+        public readonly string ServerAddress;
+        public readonly int Port;
+        public bool Running { get; private set; }
+        private TcpClient _client;
+        private bool _clientRequestedDisconnect = false;
+
+        // Messaging
+        private NetworkStream _msgStream = null;
+        private Dictionary<string, Func<string, Task>> _commandHandlers = new Dictionary<string, Func<string, Task>>();
+
+        public TcpGamesClient(string serverAddress, int port)
+        {
+            // Create a non-connectec TcpClient
+            _client = new TcpClient();
+            Running = false;
+
+            // Set other data
+            ServerAddress = serverAddress;
+            Port = port;
+        }
+
+        // Cleans up any leftover network resources
+        private void _cleanupNetworkResources()
+        {
+            _msgStream?.Close();
+            _msgStream = null;
+            _client.Close();
+        }
+
+        // Connects to the games server
+        public void Connect()
+        {
+            // Connect to the server
+            try
+            {
+                _client.Connect(ServerAddress, Port);   // Resolves DNS for us
+            }
+            catch (SocketException se)
+            {
+                Console.WriteLine("[ERROR] {0}", se.Message);
+            }
+
+            // check that we've connected
+            if (_client.Connected)
+            {
+                // Connected!
+                Console.WriteLine("Connected to the server at {0}.", _client.Client.RemoteEndPoint);
+                Running = true;
+
+                // Get the message stream
+                _msgStream = _client.GetStream();
+
+                // Hook up some packet command handlers
+                _commandHandlers["bye"] = _handleBye;
+                _commandHandlers["message"] = _handleMessage;
+                _commandHandlers["input"] = _handleInput;
+            }
+            else
+            {
+                // Nope...
+                _cleanupNetworkResources();
+                Console.WriteLine("Wasn't able to connect to the server at {0}:{1}.", ServerAddress, Port);
+            }
+        }
+
+        // Requests a disconnect, will send a "bye," message to the server
+        // This should only be called by the user
+        public void Disconnect()
+        {
+            Console.WriteLine("Disconnecting from the server...");
+            Running = false;
+            _clientRequestedDisconnect = true;
+            _sendPacket(new Packet("bye")).GetAwaiter().GetResult();
+        }
+
+        // Main loop for the Games Client
+        public void Run()
+        {
+            bool wasRunning = Running;
+
+            // Listen for messages
+            List<Task> tasks = new List<Task>();
+            while (Running)
+            {
+                // Check for new packets
+                tasks.Add(_handleIncomingPackets());
+
+                // Use less CPU
+                Thread.Sleep(10);
+
+                // Make sure that we didn't have a graceless disconnect
+                if (_isDisconnected(_client) && !_clientRequestedDisconnect)
+                {
+                    Running = false;
+                    Console.WriteLine("The server has disconnected from us ungracefully.\n:[");
+                }
+            }
+
+            // Just incase we have anymore packets, give them one second to be processed
+            Task.WaitAll(tasks.ToArray(), 1000);
+
+            // Cleanup
+            _cleanupNetworkResources();
+            if (wasRunning)
+                Console.WriteLine("Disconnected.");
+        }
+
+        // Sends packets to the server asynchronously
+        private async Task _sendPacket(Packet packet)
+        {
+            try
+            {                // convert JSON to buffer and its length to a 16 bit unsigned integer buffer
+                byte[] jsonBuffer = Encoding.UTF8.GetBytes(packet.ToJson());
+                byte[] lengthBuffer = BitConverter.GetBytes(Convert.ToUInt16(jsonBuffer.Length));
+
+                // Join the buffers
+                byte[] packetBuffer = new byte[lengthBuffer.Length + jsonBuffer.Length];
+                lengthBuffer.CopyTo(packetBuffer, 0);
+                jsonBuffer.CopyTo(packetBuffer, lengthBuffer.Length);
+
+                // Send the packet
+                await _msgStream.WriteAsync(packetBuffer, 0, packetBuffer.Length);
+
+                //Console.WriteLine("[SENT]\n{0}", packet);
+            }
+            catch(Exception) { }
+        }
+
+        // Checks for new incoming messages and handles them
+        // This method will handle one Packet at a time, even if more than one is in the memory stream
+        private async Task _handleIncomingPackets()
+        {
+            try
+            {
+                // Check for new incomding messages
+                if (_client.Available > 0)
+                {
+                    // There must be some incoming data, the first two bytes are the size of the Packet
+                    byte[] lengthBuffer = new byte[2];
+                    await _msgStream.ReadAsync(lengthBuffer, 0, 2);
+                    ushort packetByteSize = BitConverter.ToUInt16(lengthBuffer, 0);
+
+                    // Now read that many bytes from what's left in the stream, it must be the Packet
+                    byte[] jsonBuffer = new byte[packetByteSize];
+                    await _msgStream.ReadAsync(jsonBuffer, 0, jsonBuffer.Length);
+
+                    // Convert it into a packet datatype
+                    string jsonString = Encoding.UTF8.GetString(jsonBuffer);
+                    Packet packet = Packet.FromJson(jsonString);
+
+                    // Dispatch it
+                    try
+                    {
+                        await _commandHandlers[packet.Command](packet.Message);
+                    }
+                    catch (KeyNotFoundException) { }
+
+                    //Console.WriteLine("[RECEIVED]\n{0}", packet);
+                }
+            } catch (Exception) { }
+        }
+
+        #region Command Handlers
+        private Task _handleBye(string message)
+        {
+            // Print the message
+            Console.WriteLine("The server is disconnecting us with this message:");
+            Console.WriteLine(message);
+
+            // Will start the disconnection process in Run()
+            Running = false;
+            return Task.FromResult(0);  // Task.CompletedTask exists in .NET v4.6
+        }
+
+        // Just prints out a message sent from the server
+        private Task _handleMessage(string message)
+        {
+            Console.Write(message);
+            return Task.FromResult(0);  // Task.CompletedTask exists in .NET v4.6
+        }
+
+        // Gets input from the user and sends it to the server
+        private async Task _handleInput(string message)
+        {
+            // Print the prompt and get a response to send
+            Console.Write(message);
+            string responseMsg = Console.ReadLine();
+
+            // Send the response
+            Packet resp = new Packet("input", responseMsg);
+            await _sendPacket(resp);
+        }
+        #endregion // Command Handlers
+
+        #region TcpClient Helper Methods
+        // Checks if a client has disconnected ungracefully
+        // Adapted from: http://stackoverflow.com/questions/722240/instantly-detect-client-disconnection-from-server-socket
+        private static bool _isDisconnected(TcpClient client)
+        {
+            try
+            {
+                Socket s = client.Client;
+                return s.Poll(10 * 1000, SelectMode.SelectRead) && (s.Available == 0);
+            }
+            catch(SocketException)
+            {
+                // We got a socket error, assume it's disconnected
+                return true;
+            }
+        }
+        #endregion // TcpClient Helper Methods
+
+
+
+
+        #region Program Execution
+        public static TcpGamesClient gamesClient;
+
+        public static void InterruptHandler(object sender, ConsoleCancelEventArgs args)
+        {
+            // Perform a graceful disconnect
+            args.Cancel = true;
+            gamesClient?.Disconnect();
+        }
+
+        public static void Main(string[] args)
+        {
+            // Setup the Games Client
+            string host = "localhost";//args[0].Trim();
+            int port = 6000;//int.Parse(args[1].Trim());
+            gamesClient = new TcpGamesClient(host, port);
+
+            // Add a handler for a Ctrl-C press
+            Console.CancelKeyPress += InterruptHandler;
+
+            // Try to connecct & interact with the server
+            gamesClient.Connect();
+            gamesClient.Run();
+
+        }
+        #endregion // Program Execution
+    }
+}
+```
+
