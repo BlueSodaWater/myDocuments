@@ -948,3 +948,30 @@ namespace TcpGames
 }
 ```
 
+这段客户端的代码和我们写TCP聊天应用的很相似。因为包的原因，我们在顶端加了一个`Dictionary`来存储函数并且发送我们收到的消息。在构造函数中我们设置了`TcpClient`（但没有连接）并且初始化一些其他的资源。`CleanUpNetworkResources()`将会关闭我们的TcpClient和他的`NetworkStream`。
+
+`Connect()`方法比之前的更加健壮一些。首先会在try-catch块中尝试创建连接。如果失败了，就没啥好做的了，如果成功了，我们将连接我们底层的`NetworkStream`并且连接包分发器。`Disconnect()`尝试与服务器发送`bye Packet`来尝试优雅的断开连接。
+
+`Run()`方法同样还是最重要的部分。如果我们连接上了，`HandleIncomingPackets()`会做他的事情。然后会有一小段暂停来节省CPU的资源然后检查断开连接的类型。在主循环之后，我们给即将到来的包1秒的处理时间，最后我们清除所有的网络资源。
+
+`SendPacket()`将会异步给服务器发送包。同时`HandleIncomingPackets()`会检查有无可用信息并且把他们分发给正确的处理方法。
+
+由于我们在`Packet`中有三种类型的``command`，我们有三种处理方法
+
+- `Handlebye()`将会关闭客户端
+- `HandleMessage()`会把`message`中的内容打印到控制台上
+- `HandleInput()`会在命令行请求用户输入并且发送到服务器上
+
+`IsDisconnected()`用来检查时候和服务器不优雅的断开连接，最后一些文件是程序执行方法。
+
+### TCP Games - Recap
+
+像往常一样，还有很多问题需要解决还有很多提升的地方
+
+1. 我在服务器部分提到过，在处理优雅的客户端断开的时候可能存在一个竞争条件。在这里，再次提醒一遍，因为服务器可能发送一个`bye Packet`然后在客户端处理这个`Packet`之前（即使在清理资源之前，该包的ACK已经发送到服务器）清除其网络资源。我们通过让线程暂停100毫秒来修复他。一个可能的解决方法是客户端需要发送自己的`bye Packet`来响应。
+2. `NextGame()`当尝试添加玩家的时候可能锁住服务器主线程。假设在大厅中只有一个客户，但游戏不断拒接添加他们，我们将会一直陷入循环。运行的游戏还会继续运行，但是不能开始或者连接新游戏
+3. 收集`HandleNewConnection()`（在服务器上）或者`HandleIncomingPackets()`（在客户端上）是不好的。这些列表可能会增加到巨大的规模。最好建立一个结构来存放`Task`直到他们完成，然后将他们回收掉。
+4. 游戏不应该像现在这样处理客户端断开连接和数据包。最好的方法是设计一个应用,有更复杂的玩家对象，可以处理断开连接的所有类型，然后让服务器分发`Packet`给游戏。当游戏也会在完成的时候告知服务器，将当前的玩家放回等待大厅。
+5. 我们在服务器端可以设置更多并行和多线程
+6. [/u/EntroperZero](https://www.reddit.com/user/EntroperZero)在Reddit上指出，我们在`NetworkStream`上调用`ReadAsync`返回一个`Task`，他告诉我们实际读取了多少字节（而不是在第三个参数中请求了多少字节）。大多数情况下，我们将获得请求的字节数，但也有可能少获得字节数。我们应该检查请求的计数和实际的数量。[你可以在这里阅读原评论](https://www.reddit.com/r/csharp/comments/4trr8v/c_networking_part_04_multithreadedasync_tcp_w/d5jxzh3)。
+
