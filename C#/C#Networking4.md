@@ -717,3 +717,424 @@ namespace UdpFileTransfer
 `PrepareFile()`所做的事情正如他名字一样，处理文件以便发送。它接受一个文件路径，将其原始数据计算校验和，将其压缩，然后分割成`Block`。如果运行正确，会返回`true`，他的`out`参数将会被填充。
 
 这就是UdpFileSender中的全部内容，如果你忽略了`Run()`中的switch语句，我推荐你阅读他。
+
+### UDP File Transfer - Receiver
+
+这是负责从发送端那边请求文件然后下载到本地。就像其他程序一样，在底部的`Main()`中，你可以换掉一些硬编码的参数然后用其他命令代替他
+
+```c#
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Compression;
+using System.Text;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+
+namespace UdpFileTransfer
+{
+    class UdpFileReceiver
+    {
+        #region Statics
+        public static readonly int MD5ChecksumByteSize = 16;
+        #endregion // Statics
+
+        enum ReceiverState {
+            NotRunning,
+            RequestingFile,
+            WaitingForRequestFileACK,
+            WaitingForInfo,
+            PreparingForTransfer,
+            Transfering,
+            TransferSuccessful,
+        }
+
+        // Connection data
+        private UdpClient _client;
+        public readonly int Port;
+        public readonly string Hostname;
+        private bool _shutdownRequested = false;
+        private bool _running = false;
+
+        // Receive Data
+        private Dictionary<UInt32, Block> _blocksReceived = new Dictionary<UInt32, Block>();
+        private Queue<UInt32> _blockRequestQueue = new Queue<UInt32>();
+        private Queue<NetworkMessage> _packetQueue = new Queue<NetworkMessage>();
+
+        // Other data
+        private MD5 _hasher;
+
+        // Constructor, sets up connection to <hostname> on <port>
+        public UdpFileReceiver(string hostname, int port)
+        {
+            Port = port;
+            Hostname = hostname;
+
+            // Sets a default client to send/receive packets with
+            _client = new UdpClient(Hostname, Port);    // will resolve DNS for us
+            _hasher = MD5.Create();
+        }
+
+        // Tries to perform a graceful shutdown
+        public void Shutdown()
+        {
+            _shutdownRequested = true;
+        }
+
+        // Tries to grab a file and download it to our local machine
+        public void GetFile(string filename)
+        {
+            // Init the get file state
+            Console.WriteLine("Requesting file: {0}", filename);
+            ReceiverState state = ReceiverState.RequestingFile;
+            byte[] checksum = null;
+            UInt32 fileSize = 0;
+            UInt32 numBlocks = 0;
+            UInt32 totalRequestedBlocks = 0;
+            Stopwatch transferTimer = new Stopwatch();
+
+            // Small function to reset the transfer state
+            Action ResetTransferState = new Action(() =>
+                {
+                    state = ReceiverState.RequestingFile;
+                    checksum = null;
+                    fileSize = 0;
+                    numBlocks = 0;
+                    totalRequestedBlocks = 0;
+                    _blockRequestQueue.Clear();
+                    _blocksReceived.Clear();
+                    transferTimer.Reset();
+                });
+
+            // Main loop
+            _running = true;
+            bool senderQuit = false;
+            bool wasRunning = _running;
+            while (_running)
+            {
+                // Check for some new packets (if there are some)
+                _checkForNetworkMessages();
+                NetworkMessage nm = (_packetQueue.Count > 0) ? _packetQueue.Dequeue() : null;
+
+                // In case the sender is shutdown, quit
+                bool isBye = (nm == null) ? false : nm.Packet.IsBye;
+                if (isBye)
+                    senderQuit = true;
+                
+                // The state
+                switch (state)
+                {
+                    case ReceiverState.RequestingFile:
+                        // Create the REQF
+                        RequestFilePacket REQF = new RequestFilePacket();
+                        REQF.Filename = filename;
+
+                        // Send it
+                        byte[] buffer = REQF.GetBytes();
+                        _client.Send(buffer, buffer.Length);
+
+                        // Move the state to waiting for ACK
+                        state = ReceiverState.WaitingForRequestFileACK;
+                        break;
+
+                    case ReceiverState.WaitingForRequestFileACK:
+                        // If it is an ACK and the payload is the filename, we're good
+                        bool isAck = (nm == null) ? false : (nm.Packet.IsAck);
+                        if (isAck)
+                        {
+                            AckPacket ACK = new AckPacket(nm.Packet);
+
+                            // Make sure they respond with the filename
+                            if (ACK.Message == filename)
+                            {
+                                // They got it, shift the state
+                                state = ReceiverState.WaitingForInfo;
+                                Console.WriteLine("They have the file, waiting for INFO...");
+                            }
+                            else
+                                ResetTransferState();   // Not what we wanted, reset
+                        }
+                        break;
+
+                    case ReceiverState.WaitingForInfo:
+                        // Verify it's file info
+                        bool isInfo = (nm == null) ? false : (nm.Packet.IsInfo);
+                        if (isInfo)
+                        {
+                            // Pull data
+                            InfoPacket INFO = new InfoPacket(nm.Packet);
+                            fileSize = INFO.FileSize;
+                            checksum = INFO.Checksum;
+                            numBlocks = INFO.BlockCount;
+
+                            // Allocate some client side resources
+                            Console.WriteLine("Received an INFO packet:");
+                            Console.WriteLine("  Max block size: {0}", INFO.MaxBlockSize);
+                            Console.WriteLine("  Num blocks: {0}", INFO.BlockCount);
+
+                            // Send an ACK for the INFO
+                            AckPacket ACK = new AckPacket();
+                            ACK.Message = "INFO";
+                            buffer = ACK.GetBytes();
+                            _client.Send(buffer, buffer.Length);
+
+                            // Shift the state to ready
+                            state = ReceiverState.PreparingForTransfer;
+                        }
+                        break;
+
+                    case ReceiverState.PreparingForTransfer:
+                        // Prepare the request queue
+                        for (UInt32 id = 1; id <= numBlocks; id++)
+                            _blockRequestQueue.Enqueue(id);
+                        totalRequestedBlocks += numBlocks;
+
+                        // Shift the state
+                        Console.WriteLine("Starting Transfer...");
+                        transferTimer.Start();
+                        state = ReceiverState.Transfering;
+                        break;
+
+                    case ReceiverState.Transfering:
+                        // Send a block request
+                        if (_blockRequestQueue.Count > 0)
+                        {
+                            // Setup a request for a Block
+                            UInt32 id = _blockRequestQueue.Dequeue();
+                            RequestBlockPacket REQB = new RequestBlockPacket();
+                            REQB.Number = id;
+
+                            // Send the Packet
+                            buffer = REQB.GetBytes();
+                            _client.Send(buffer, buffer.Length);
+
+                            // Some handy info
+                            Console.WriteLine("Sent request for Block #{0}", id);
+                        }
+
+                        // Check if we have any blocks ourselves in the queue
+                        bool isSend = (nm == null) ? false : (nm.Packet.IsSend);
+                        if (isSend)
+                        {
+                            // Get the data (and save it
+                            SendPacket SEND = new SendPacket(nm.Packet);
+                            Block block = SEND.Block;
+                            _blocksReceived.Add(block.Number, block);
+
+                            // Print some info
+                            Console.WriteLine("Received Block #{0} [{1} bytes]", block.Number, block.Data.Length);
+                        }
+
+                        // Requeue any requests that we haven't received
+                        if ((_blockRequestQueue.Count == 0) && (_blocksReceived.Count != numBlocks))
+                        {
+                            for (UInt32 id = 1; id <= numBlocks; id++)
+                            {
+                                if (!_blocksReceived.ContainsKey(id) && !_blockRequestQueue.Contains(id))
+                                {
+                                    _blockRequestQueue.Enqueue(id);
+                                    totalRequestedBlocks++;
+                                }
+                            }
+                        }
+
+                        // Did we get all the block we need?  Move to the "transfer successful state."
+                        if (_blocksReceived.Count == numBlocks)
+                            state = ReceiverState.TransferSuccessful;
+                        break;
+
+                    case ReceiverState.TransferSuccessful:
+                        transferTimer.Stop();
+
+                        // Things were good, send a BYE message
+                        Packet BYE = new Packet(Packet.Bye);
+                        buffer = BYE.GetBytes();
+                        _client.Send(buffer, buffer.Length);
+
+                        Console.WriteLine("Transfer successful; it took {0:0.000}s with a success ratio of {1:0.000}.",
+                            transferTimer.Elapsed.TotalSeconds, (double)numBlocks / (double)totalRequestedBlocks);
+                        Console.WriteLine("Decompressing the Blocks...");
+
+                        // Reconstruct the data
+                        if (_saveBlocksToFile(filename, checksum, fileSize))
+                            Console.WriteLine("Saved file as {0}.", filename);
+                        else
+                            Console.WriteLine("There was some trouble in saving the Blocks to {0}.", filename);
+
+                        // And we're done here
+                        _running = false;
+                        break;
+
+                }
+
+                // Sleep
+                Thread.Sleep(1);
+
+                // Check for shutdown
+                _running &= !_shutdownRequested;
+                _running &= !senderQuit;
+            }
+
+            // Send a BYE message if the user wanted to cancel
+            if (_shutdownRequested && wasRunning)
+            {
+                Console.WriteLine("User canceled transfer.");
+
+                Packet BYE = new Packet(Packet.Bye);
+                byte[] buffer = BYE.GetBytes();
+                _client.Send(buffer, buffer.Length);
+            }
+
+            // If the server told us to shutdown
+            if (senderQuit && wasRunning)
+                Console.WriteLine("The sender quit on us, canceling the transfer.");
+
+            ResetTransferState();           // This also cleans up collections
+            _shutdownRequested = false;     // In case we shut down one download, but want to start a new one
+        }
+
+        public void Close()
+        {
+            _client.Close();
+        }
+
+        // Trys to fill the queue of packets
+        private void _checkForNetworkMessages()
+        {
+            if (!_running)
+                return;
+
+            // Check that there is something available (and at least four bytes for type)
+            int bytesAvailable = _client.Available;
+            if (bytesAvailable >= 4)
+            {
+                // This will read ONE datagram (even if multiple have been received)
+                IPEndPoint ep = new IPEndPoint(IPAddress.Any, 0);
+                byte[] buffer = _client.Receive(ref ep);
+                Packet p = new Packet(buffer);
+
+                // Create the message structure and queue it up for processing
+                NetworkMessage nm = new NetworkMessage();
+                nm.Sender = ep;
+                nm.Packet = p;
+                _packetQueue.Enqueue(nm);
+            }
+        }
+
+        // Trys to uncompress the blocks and save them to a file
+        private bool _saveBlocksToFile(string filename, byte[] networkChecksum, UInt32 fileSize)
+        {
+            bool good = false;
+
+            try
+            {
+                // Allocate some memory
+                int compressedByteSize = 0;
+                foreach (Block block in _blocksReceived.Values)
+                    compressedByteSize += block.Data.Length;
+                byte[] compressedBytes = new byte[compressedByteSize];
+
+                // Reconstruct into one big block
+                int cursor = 0;
+                for (UInt32 id = 1; id <= _blocksReceived.Keys.Count; id++)
+                {
+                    Block block = _blocksReceived[id];
+                    block.Data.CopyTo(compressedBytes, cursor);
+                    cursor += Convert.ToInt32(block.Data.Length);
+                }
+
+                // Now save it
+                using (MemoryStream uncompressedStream = new MemoryStream())
+                using (MemoryStream compressedStream = new MemoryStream(compressedBytes))
+                using (DeflateStream deflateStream = new DeflateStream(compressedStream, CompressionMode.Decompress))
+                {
+                    deflateStream.CopyTo(uncompressedStream);
+
+                    // Verify checksums
+                    uncompressedStream.Position = 0;
+                    byte[] checksum = _hasher.ComputeHash(uncompressedStream);
+                    if (!Enumerable.SequenceEqual(networkChecksum, checksum))
+                        throw new Exception("Checksum of uncompressed blocks doesn't match that of INFO packet.");
+
+                    // Write it to the file
+                    uncompressedStream.Position = 0;
+                    using (FileStream fileStream = new FileStream(filename, FileMode.Create))
+                        uncompressedStream.CopyTo(fileStream);
+                }
+
+                good = true;
+            }
+            catch (Exception e)
+            {
+                // Crap...
+                Console.WriteLine("Could not save the blocks to \"{0}\", reason:", filename);
+                Console.WriteLine(e.Message);
+            }
+
+            return good;
+        }
+
+
+
+
+
+        #region Program Execution
+        public static UdpFileReceiver fileReceiver;
+
+        public static void InterruptHandler(object sender, ConsoleCancelEventArgs args)
+        {
+            args.Cancel = true;
+            fileReceiver?.Shutdown();
+        }
+
+        public static void Main(string[] args)
+        {
+            // setup the receiver
+            string hostname = "localhost";//args[0].Trim();
+            int port = 6000;//int.Parse(args[1].Trim());
+            string filename = "short_message.txt";//args[2].Trim();
+            fileReceiver = new UdpFileReceiver(hostname, port);
+
+            // Add the Ctrl-C handler
+            Console.CancelKeyPress += InterruptHandler;
+
+            // Get a file
+            fileReceiver.GetFile(filename);
+            fileReceiver.Close();
+        }
+        #endregion // Program Execution
+    }
+}
+```
+
+就像发送方一样，在构造函数中我们用默认远程主机（应该是发送方）创建了我们的`UdpClient`。
+
+我提到过在`UdpClient`中有一个`Connect`方法（[地址](https://docs.microsoft.com/en-us/dotnet/api/system.net.sockets.udpclient.connect?redirectedfrom=MSDN&view=net-5.0#System_Net_Sockets_UdpClient_Connect_System_String_System_Int32_)），请注意这是一个谎言，因为UDP是无连接的嫌疑。事实上，他所做的就是设一个默认远程主机，所以每次你调用`Send`方法的时候，你不需要指定发送到哪里，它只会去那个主机。这也应用于`UdpClient`中一些其他构造函数（就像我们其中使用的一样）
+
+`ShutDown()`仅仅是用来请求停止文件传输，你可以在`GetFile()`中看他是如何运作的
+
+`GetFile()`是这个类中最重要的方法，它结构和`UdpFileSender.Run()`很像。他是与发送者进行所有通信的工具。让我们拆分他。在函数的头部，定义了一些文件传输的变量和重置帮助类。在`while`循环的开始，我们检查是否有`NetworkMessage`。首先检查最新获得的`Packet`是否是`BYE`，然后进入switch语句。`switch`语句用来控制文件传输状态（`REQF`，等待`ACK`，等待`INFO`，ACK等待）。在`ReceiverState.Transfering case`，他将会清空Block请求队列，检测是否有`SEND`消息（即`Block`数据）。如果请求队列是空的，但我们没有获取任何`Block`，他将会用失踪的`Block.Number`填满重新请求队列。但是如果我们获取了所有的Block，然后我们移动到下一个状态，给发送方发送`BYE`（这样发送方可以接受新的传输）。然后我们把Block整合到字节数组中，解压他们，然后保存文件。在函数的最后我们检测传输时由用户请求还是由发送端提前结束的。
+
+`Close()`将会清除所有的网络资源，就是指`UdpClient`。
+
+`CheckForNetworkMessage`和发送端的是相同的，看是否有Packet消息中是否有足够的字节，然后将其放入队列中处理。
+
+`SaveBlockToFile()`当获取`Block`之后，重新组装他们，解压数据，检测校验和然后将其保存到磁盘。
+
+### UDP File Transfer - Recap
+
+这是下面的截图，使用的测试文件是一个更小的版本。使用SFTP传输视频大概需要14秒。而我们自己创建应用只需要9秒，在这种情况下，有很多原因导致SFTP变慢，但这个问题交给你们自己解决。
+
+就像我们之前的项目一样，我们有一些不足和改进的地方，让我们来分析他：
+
+- 程序会占用大量的堆内存，当我使用大文件测试的时候，我得到了一些OutOfMemoryException异常抛出，当我们发送和获取的时候，我们需要把`Block`保存到硬盘上（而不是将其存在内存中）
+- 发送端需要更好的客户端控制。假设第二个（恶意的）客户端连接上之后在传输中途发送了一个`BYE`消息。同时会停止第一个的传输，第一个接收者设置都不知道发生了什么，会一直排队请求块。发送者在与一个客户端进行传输时，应该忽略从其他客户端的任何数据包
+- ***Timeouts & Retries***，这点很重要，因此我将其加粗，斜体。我们的代码没有任何的超时和重传（除了块队列）。当一个程序等到`ACK`的时候，它应该等待一段时间后重新发送他的`Packet`防止之前那个丢了。在真实生活中我们需要为`Packet`（`REQF`，`INFO`，`ACK`的高等）添加超时和重传。
+  - 事实上`Block`重拍很糟糕。在请求另一个块的时候，它应该等待一会。当我第一次在网上测试的时候，我的接收端在发送端响应第一个请求之前，创建了多个`REQB`。
+
+记住，这个应用的目标是展示UDP如何工作。如果你想要把UDP传输文件放入应用中，有很多地方需要更改。
+
