@@ -132,7 +132,7 @@ namespace PongGame
 
 这和文件传输例子中的几乎相同，但也增加了字段，当一方接收到`Packet`我们标记的时间。
 
-```c#
+​```c#
 using System;
 using System.Net;
 
@@ -788,6 +788,870 @@ namespace PongGame
 
             // Nope, nothing
             return false;
+        }
+    }
+}
+```
+
+### UDP Pong - Server
+
+在开始之前，我想提醒一下，`PongServer.cs`中没有游戏逻辑的成分，代码在`Arena.cs`中，因此你会看到一个叫做Arena的类，它的代码在下一页。
+
+### PlayerInfo
+
+这是另一个数据类型只在服务器中使用，它包含这连接客户端的信息和他们目前状态
+
+```c#
+using System;
+using System.Net;
+
+namespace PongGame
+{
+    // Data structure for the server to manage clients
+    public class PlayerInfo
+    {
+        public Paddle Paddle;
+        public IPEndPoint Endpoint;
+        public DateTime LastPacketReceivedTime = DateTime.MinValue;     // From Server Time
+        public DateTime LastPacketSentTime = DateTime.MinValue;         // From Server Time
+        public long LastPacketReceivedTimestamp = 0;                    // From Client Time
+        public bool HavePaddle = false;
+        public bool Ready = false;
+
+        public bool IsSet {
+            get { return Endpoint != null; }
+        }
+    }
+}
+```
+
+三个处理时间的字段看着有点令人困惑，让我来解释一下
+
+- `LastPacketReceivedTime` - 这代表我们从一个客户端获取一个`Packet`的时间，它是通过`DateTime.Now`获取的，在函数`PongServer._networkRun()`。它用来检测超时。
+- `LastPacketSentTime` - 这代表我们最后一次发送`Packet`给客户端的时间。它记录在`Arena._sendTo()`方法中。着用来确保我们不会太频繁的给客户端发送消息。
+- `LastPacketReceivedTimestamp` - 不行其他的两个，这个是用来测量客户端的时间的，来自于`Packert.Timestamp`字段。当设置他的时候，它的值只能比之前更高，用来确保我们使用的是客户端的最新消息。因为在UDP中，一些较晚发送的数据报可能比较早发送的报更早到达，这会导致旧的报被遗弃。
+
+### PongServer
+
+`PongServer`的职责只是用来从网络中读取数据，将其写入客户端，管理`Arena`
+
+```c#
+using System;
+using System.Linq;
+using System.Collections.Generic;
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+
+namespace PongGame
+{
+    public class PongServer
+    {
+        // Network Stuff
+        private UdpClient _udpClient;
+        public readonly int Port;
+
+        // Messaging
+        Thread _networkThread;
+        private ConcurrentQueue<NetworkMessage> _incomingMessages
+            = new ConcurrentQueue<NetworkMessage>();
+        private ConcurrentQueue<Tuple<Packet, IPEndPoint>> _outgoingMessages
+            = new ConcurrentQueue<Tuple<Packet, IPEndPoint>>();
+        private ConcurrentQueue<IPEndPoint> _sendByePacketTo
+            = new ConcurrentQueue<IPEndPoint>();
+
+        // Arena management
+        private ConcurrentDictionary<Arena, byte> _activeArenas             // Being used as a HashSet
+            = new ConcurrentDictionary<Arena, byte>();
+        private ConcurrentDictionary<IPEndPoint, Arena> _playerToArenaMap
+            = new ConcurrentDictionary<IPEndPoint, Arena>();
+        private Arena _nextArena;
+
+        // Used to check if we are running the server or not
+        private ThreadSafe<bool> _running = new ThreadSafe<bool>(false);
+
+        public PongServer(int port)
+        {
+            Port = port;
+
+            // Create the UDP socket (IPv4)
+            _udpClient = new UdpClient(Port, AddressFamily.InterNetwork);
+        }
+
+        // Notifies that we can start the server
+        public void Start()
+        {
+            _running.Value = true;
+        }
+
+        // Starts a shutdown of the server
+        public void Shutdown()
+        {
+            if (_running.Value)
+            {
+                Console.WriteLine("[Server] Shutdown requested by user.");
+
+                // Close any active games
+                Queue<Arena> arenas = new Queue<Arena>(_activeArenas.Keys);
+                foreach (Arena arena in arenas)
+                    arena.Stop();
+
+                // Stops the network thread
+                _running.Value = false;
+            }
+        }
+
+        // Cleans up any necessary resources
+        public void Close()
+        {
+            _networkThread?.Join(TimeSpan.FromSeconds(10));
+            _udpClient.Close();
+        }
+
+        // Small lambda function to add a new arena
+        private void _addNewArena ()
+        {
+            _nextArena = new Arena(this);
+            _nextArena.Start();
+            _activeArenas.TryAdd(_nextArena, 0);
+        }
+
+        // Used by an Arena to notify the PingServer that it's done
+        public void NotifyDone(Arena arena)
+        {
+            // First remove from the Player->Arena map
+            Arena a;
+            if (arena.LeftPlayer.IsSet)
+                _playerToArenaMap.TryRemove(arena.LeftPlayer.Endpoint, out a);
+            if (arena.RightPlayer.IsSet)
+                _playerToArenaMap.TryRemove(arena.RightPlayer.Endpoint, out a);
+
+            // Remove from the active games hashset
+            byte b;
+            _activeArenas.TryRemove(arena, out b);
+        }
+
+        // Main loop function for the server
+        public void Run()
+        {
+            // Make sure we've called Start()
+            if (_running.Value)
+            {
+                // Info
+                Console.WriteLine("[Server] Running Ping Game");
+
+                // Start the packet receiving Thread
+                _networkThread = new Thread(new ThreadStart(_networkRun));
+                _networkThread.Start();
+
+                // Startup the first Arena
+                _addNewArena();
+            }
+
+            // Main loop of game server
+            bool running = _running.Value;
+            while (running)
+            {
+                // If we have some messages in the queue, pull them out
+                NetworkMessage nm;
+                bool have = _incomingMessages.TryDequeue(out nm);
+                if (have)
+                {
+                    // Depending on what type of packet it is process it
+                    if (nm.Packet.Type == PacketType.RequestJoin)
+                    {
+                        // We have a new client, put them into an arena
+                        bool added = _nextArena.TryAddPlayer(nm.Sender);
+                        if (added)
+                            _playerToArenaMap.TryAdd(nm.Sender, _nextArena);
+
+                        // If they didn't go in that means we're full, make a new arena
+                        if (!added)
+                        {
+                            _addNewArena();
+
+                            // Now there should be room
+                            _nextArena.TryAddPlayer(nm.Sender);
+                            _playerToArenaMap.TryAdd(nm.Sender, _nextArena);
+                        }
+
+                        // Dispatch the message
+                        _nextArena.EnqueMessage(nm);
+                    }
+                    else
+                    {
+                        // Dispatch it to an existing arena
+                        Arena arena;
+                        if (_playerToArenaMap.TryGetValue(nm.Sender, out arena))
+                            arena.EnqueMessage(nm);
+                    }
+                }
+                else
+                    Thread.Sleep(1);    // Take a short nap if there are no messages
+
+                // Check for quit
+                running &= _running.Value;
+            }
+        }
+
+        #region Network Functions
+        // This function is meant to be run in its own thread
+        // Is writes and reads Packets to/from the UdpClient
+        private void _networkRun()
+        {
+            if (!_running.Value)
+                return;
+             
+            Console.WriteLine("[Server] Waiting for UDP datagrams on port {0}", Port);
+
+            while (_running.Value)
+            {
+                bool canRead = _udpClient.Available > 0;
+                int numToWrite = _outgoingMessages.Count;
+                int numToDisconnect = _sendByePacketTo.Count;
+
+                // Get data if there is some
+                if (canRead)
+                {
+                    // Read in one datagram
+                    IPEndPoint ep = new IPEndPoint(IPAddress.Any, 0);
+                    byte[] data = _udpClient.Receive(ref ep);              // Blocks
+
+                    // Enque a new message
+                    NetworkMessage nm = new NetworkMessage();
+                    nm.Sender = ep;
+                    nm.Packet = new Packet(data);
+                    nm.ReceiveTime = DateTime.Now;
+
+                    _incomingMessages.Enqueue(nm);
+
+                    //Console.WriteLine("RCVD: {0}", nm.Packet);
+                }
+
+                // Write out queued
+                for (int i = 0; i < numToWrite; i++)
+                {
+                    // Send some data
+                    Tuple<Packet, IPEndPoint> msg;
+                    bool have = _outgoingMessages.TryDequeue(out msg);
+                    if (have)
+                        msg.Item1.Send(_udpClient, msg.Item2);
+
+                    //Console.WriteLine("SENT: {0}", msg.Item1);
+                }
+
+                // Notify clients of Bye
+                for (int i = 0; i < numToDisconnect; i++)
+                {
+                    IPEndPoint to;
+                    bool have = _sendByePacketTo.TryDequeue(out to);
+                    if (have)
+                    {
+                        ByePacket bp = new ByePacket();
+                        bp.Send(_udpClient, to);
+                    }
+                }
+
+                // If Nothing happened, take a nap
+                if (!canRead && (numToWrite == 0) && (numToDisconnect == 0))
+                    Thread.Sleep(1);
+            }
+
+            Console.WriteLine("[Server] Done listening for UDP datagrams");
+
+            // Wait for all arena's thread to join
+            Queue<Arena> arenas = new Queue<Arena>(_activeArenas.Keys);
+            if (arenas.Count > 0)
+            {
+                Console.WriteLine("[Server] Waiting for active Areans to finish...");
+                foreach (Arena arena in arenas)
+                    arena.JoinThread();
+            }
+
+            // See which clients are left to notify of Bye
+            if (_sendByePacketTo.Count > 0)
+            {
+                Console.WriteLine("[Server] Notifying remaining clients of shutdown...");
+
+                // run in a loop until we've told everyone else
+                IPEndPoint to;
+                bool have = _sendByePacketTo.TryDequeue(out to);
+                while (have)
+                {
+                    ByePacket bp = new ByePacket();
+                    bp.Send(_udpClient, to);
+                    have = _sendByePacketTo.TryDequeue(out to);
+                }
+            }
+        }
+
+        // Queues up a Packet to be send to another person
+        public void SendPacket(Packet packet, IPEndPoint to)
+        {
+            _outgoingMessages.Enqueue(new Tuple<Packet, IPEndPoint>(packet, to));
+        }
+
+        // Will queue to send a ByePacket to the specified endpoint
+        public void SendBye(IPEndPoint to)
+        {
+            _sendByePacketTo.Enqueue(to);
+        }
+        #endregion  // Network Functions
+
+
+
+
+
+        #region Program Execution
+        public static PongServer server;
+
+        public static void InterruptHandler(object sender, ConsoleCancelEventArgs args)
+        {
+            // Do a graceful shutdown
+            args.Cancel = true;
+            server?.Shutdown();
+        }
+
+        public static void Main(string[] args)
+        {
+            // Setup the server
+            int port = 6000;//int.Parse(args[0].Trim());
+            server = new PongServer(port);
+
+            // Add the Ctrl-C handler
+            Console.CancelKeyPress += InterruptHandler;
+
+            // Run it
+            server.Start();
+            server.Run();
+            server.Close();
+        }
+        #endregion // Program Execution
+    }
+}
+```
+
+让我们解释这里发生了什么。
+
+在类的顶部，我们有一些 [ConcurrentQueues](https://msdn.microsoft.com/en-us/library/dd267265(v=vs.110).aspx) 和 [ConcurrentDictionaries](https://msdn.microsoft.com/en-us/library/dd287191(v=vs.110).aspx)。前三个用来处理消息。注意一下，`_activeArenas`用作 [HashSet](https://msdn.microsoft.com/en-us/library/bb359438(v=vs.110).aspx)。因为 collection没有concurrent的hashset。
+
+构造函数的作用是用来设定`Port`的号码，然后初始化底层的 [UdpClient](http://msdn.microsoft.com/en-us/library/system.net.sockets.udpclient(v=vs.110).aspx)。用来监听是由IPv6连接。
+
+`Start()`用来标记我们的服务器可以开始处理客户端。`Shutdown()`则相反。如果服务器早在运行，它会告诉运行的`Arena`来结束游戏。`Close()`将会清除所有资源。
+
+`AddNewArena()`是一个小的帮助函数开启一个新的`Arena`实例（也在是其他的线程中启动）然后把它放到`_nextArena`变量中。
+
+`NotifyDone()`仅仅由`Arena`调用。它告诉`PongServer`从`_playerToArenaMap`移除任何连接的客户端，并且`_activeArenas`中移除自己
+
+`Run()`是`PongServer`中的主方法。它只会在之前已经调用过`Start()`之后才会执行。首先，他会创建一个新的`Thread`来解决所有的即将到来和即将发出的消息（通过网络），然后实例化第一个`Arena`。在`while(running)`循环中，他会检测我们是否获得了新的`NetworkMessage`。
+
+- 如果一个`Packet`是`RequestJoin`，他将会将其加入到下一个运行的`Arena`中。如果`_nextArena`已经满了（`TryAdd()`返回`false`），他会调用`AddArena()`然后重新试着将其加入。
+- 但如果`Packet`如果不是`RequestJoin`，他将会将他发送到`Sender`所在的`Arena`。
+  - 如果你纳闷如果`Sender`不在运行的`Arena`中的情况会发生什么，消息会遗弃。
+
+在循环的结束`Thread.Sleep()`将会调用来节省CPU资源然后检查服务器是否仍然运行。
+
+`NetworkRun()`是另一个重要的循环函数。他在自己的独立线程中运行(`_networkThread`)。当我们不告诉`PongServer`停止，他会检查是否有数据报等待我们，并写出我们已经在排队的`Packet`（从`_outgoingMessages`和`_sendByPacketTo`）。在没有任何数据接收和发送的情况下，我们的函数休息一会。当结束监听消息的时候（即`PongServer`关闭），他会让所有活跃的`Arena`停止他们的线程。自此之后，如果有任何连接的客户端，给他们发送`ByePacket`消息
+
+`SendPacket()`和`SendBye()`在功能上是基本相同的，将消息排队发送给客户端。唯一的区别是后一个方法用来和客户端断开连接。
+
+在文件的底部，我们有一些程序执行的硬编码代码。在`Main()`方法中，我们创建`PongServer`实例，然后增加按压Ctrl-C事件。
+
+### UDP Pong - Arena
+
+这是服务器上弹球游戏的逻辑
+
+```c#
+using System;
+using System.Threading;
+using System.Net;
+using System.Net.Sockets;
+using System.Diagnostics;
+using System.Collections.Concurrent;
+using Microsoft.Xna.Framework;
+
+namespace PongGame
+{
+    public enum ArenaState
+    {
+        NotRunning,
+        WaitingForPlayers,
+        NotifyingGameStart,
+        InGame,
+        GameOver
+    }
+
+    // This is where the game takes place
+    public class Arena
+    {
+        // Game objects & state info
+        public ThreadSafe<ArenaState> State { get; private set; } = new ThreadSafe<ArenaState>();
+        private Ball _ball = new Ball();
+        public PlayerInfo LeftPlayer { get; private set; } = new PlayerInfo();      // contains Paddle
+        public PlayerInfo RightPlayer { get; private set; } = new PlayerInfo();     // contains Paddle
+        private object _setPlayerLock = new object();
+        private Stopwatch _gameTimer = new Stopwatch();
+
+        // Connection info
+        private PongServer _server;
+        private TimeSpan _heartbeatTimeout = TimeSpan.FromSeconds(20);
+
+        // Packet queue
+        private ConcurrentQueue<NetworkMessage> _messages = new ConcurrentQueue<NetworkMessage>();
+
+        // Shutdown data
+        private ThreadSafe<bool> _stopRequested = new ThreadSafe<bool>(false);
+
+        // Other
+        private Thread _arenaThread;
+        private Random _random = new Random();
+        public readonly int Id;
+        private static int _nextId = 1;
+
+        public Arena(PongServer server)
+        {
+            _server = server;
+            Id = _nextId++;
+            State.Value = ArenaState.NotRunning;
+
+            // Some other data
+            LeftPlayer.Paddle = new Paddle(PaddleSide.Left);
+            RightPlayer.Paddle = new Paddle(PaddleSide.Right);
+        }
+
+        // Returns true if the player was added,
+        // false otherwise (max two players will be accepeted)
+        public bool TryAddPlayer(IPEndPoint playerIP)
+        {
+            if (State.Value == ArenaState.WaitingForPlayers)
+            {
+                lock (_setPlayerLock)
+                {
+                    // First do the left
+                    if (!LeftPlayer.IsSet)
+                    {
+                        LeftPlayer.Endpoint = playerIP;
+                        return true;
+                    }
+
+                    // Then the Right
+                    if (!RightPlayer.IsSet)
+                    {
+                        RightPlayer.Endpoint = playerIP;
+                        return true;
+                    }
+                }
+            }
+
+            // Couldn't add any more
+            return false;
+        }
+
+        // Initializes the game objects to a default state and start a new Thread
+        public void Start()
+        {
+            // Shift the state
+            State.Value = ArenaState.WaitingForPlayers;
+
+            // Start the internal thread on Run
+            _arenaThread = new Thread(new ThreadStart(_arenaRun));
+            _arenaThread.Start();
+        }
+
+        // Tells the game to stop
+        public void Stop()
+        {
+            _stopRequested.Value = true;
+        }
+
+        // This runs in its own Thread
+        // It is the actual game
+        private void _arenaRun()
+        {
+            Console.WriteLine("[{0:000}] Waiting for players", Id);
+            GameTime gameTime = new GameTime();
+
+            // Varibables used in the switch
+            TimeSpan notifyGameStartTimeout = TimeSpan.FromSeconds(2.5);
+            TimeSpan sendGameStateTimeout = TimeSpan.FromMilliseconds(1000f / 30f);  // How often to update the players
+
+            // The loop
+            bool running = true;
+            bool playerDropped = false;
+            while (running)
+            {
+                // Pop off a message (if there is one)
+                NetworkMessage message;
+                bool haveMsg = _messages.TryDequeue(out message);
+
+                switch (State.Value)
+                {
+                    case ArenaState.WaitingForPlayers:
+                        if (haveMsg)
+                        {
+                            // Wait until we have two players
+                            _handleConnectionSetup(LeftPlayer, message);
+                            _handleConnectionSetup(RightPlayer, message);
+
+                            // Check if we are ready or not
+                            if (LeftPlayer.HavePaddle && RightPlayer.HavePaddle)
+                            {
+                                // Try sending the GameStart packet immediately
+                                _notifyGameStart(LeftPlayer, new TimeSpan());
+                                _notifyGameStart(RightPlayer, new TimeSpan());
+
+                                // Shift the state
+                                State.Value = ArenaState.NotifyingGameStart;
+                            }
+                        }
+                        break;
+
+                    case ArenaState.NotifyingGameStart:
+                        // Try sending the GameStart packet
+                        _notifyGameStart(LeftPlayer, notifyGameStartTimeout);
+                        _notifyGameStart(RightPlayer, notifyGameStartTimeout);
+
+                        // Check for ACK
+                        if (haveMsg && (message.Packet.Type == PacketType.GameStartAck))
+                        {
+                            // Mark true for those who have sent something
+                            if (message.Sender.Equals(LeftPlayer.Endpoint))
+                                LeftPlayer.Ready = true;
+                            else if (message.Sender.Equals(RightPlayer.Endpoint))
+                                RightPlayer.Ready = true;
+                        }
+
+                        // Are we ready to send/received game data?
+                        if (LeftPlayer.Ready && RightPlayer.Ready)
+                        {
+                            // Initlize some game object positions
+                            _ball.Initialize();
+                            LeftPlayer.Paddle.Initialize();
+                            RightPlayer.Paddle.Initialize();
+
+                            // Send a basic game state
+                            _sendGameState(LeftPlayer, new TimeSpan());
+                            _sendGameState(RightPlayer, new TimeSpan());
+
+                            // Start the game timer
+                            State.Value = ArenaState.InGame;
+                            Console.WriteLine("[{0:000}] Starting Game", Id);
+                            _gameTimer.Start();
+                        }
+
+                        break;
+
+                    case ArenaState.InGame:
+                        // Update the game timer
+                        TimeSpan now = _gameTimer.Elapsed;
+                        gameTime = new GameTime(now, now - gameTime.TotalGameTime);
+
+                        // Get paddle postions from clients
+                        if (haveMsg)
+                        {
+                            switch (message.Packet.Type)
+                            {
+                                case PacketType.PaddlePosition:
+                                    _handlePaddleUpdate(message);
+                                    break;
+
+                                case PacketType.Heartbeat:
+                                    // Respond with an ACK
+                                    HeartbeatAckPacket hap = new HeartbeatAckPacket();
+                                    PlayerInfo player = message.Sender.Equals(LeftPlayer.Endpoint) ? LeftPlayer : RightPlayer;
+                                    _sendTo(player, hap);
+
+                                    // Record time
+                                    player.LastPacketReceivedTime = message.ReceiveTime;
+                                    break;
+                            }
+                        }
+
+                        //Update the game components
+                        _ball.ServerSideUpdate(gameTime);
+                        _checkForBallCollisions();
+
+                        // Send the data
+                        _sendGameState(LeftPlayer, sendGameStateTimeout);
+                        _sendGameState(RightPlayer, sendGameStateTimeout);
+                        break;
+                }
+
+                // Check for a quit from one of the clients
+                if (haveMsg && (message.Packet.Type == PacketType.Bye))
+                {
+                    // Well, someone dropped
+                    PlayerInfo player = message.Sender.Equals(LeftPlayer.Endpoint) ? LeftPlayer : RightPlayer;
+                    running = false;
+                    Console.WriteLine("[{0:000}] Quit detected from {1} at {2}",
+                        Id, player.Paddle.Side, _gameTimer.Elapsed);
+
+                    // Tell the other one
+                    if (player.Paddle.Side == PaddleSide.Left)
+                    {
+                        // Left Quit, tell Right
+                        if (RightPlayer.IsSet)
+                            _server.SendBye(RightPlayer.Endpoint);
+                    }
+                    else
+                    {
+                        // Right Quit, tell Left
+                        if (LeftPlayer.IsSet)
+                            _server.SendBye(LeftPlayer.Endpoint);
+                    }
+                }
+
+                // Check for timeouts
+                playerDropped |= _timedOut(LeftPlayer);
+                playerDropped |= _timedOut(RightPlayer);
+
+                // Small nap
+                Thread.Sleep(1);
+
+                // Check quit values
+                running &= !_stopRequested.Value;
+                running &= !playerDropped;
+            }
+
+            // End the game
+            _gameTimer.Stop();
+            State.Value = ArenaState.GameOver;
+            Console.WriteLine("[{0:000}] Game Over, total game time was {1}", Id, _gameTimer.Elapsed);
+
+            // If the stop was requested, gracefully tell the players to quit
+            if (_stopRequested.Value)
+            {
+                Console.WriteLine("[{0:000}] Notifying Players of server shutdown", Id);
+
+                if (LeftPlayer.IsSet)
+                    _server.SendBye(LeftPlayer.Endpoint);
+                if (RightPlayer.IsSet)
+                    _server.SendBye(RightPlayer.Endpoint);
+            }
+
+            // Tell the server that we're finished
+            _server.NotifyDone(this);
+        }
+
+        // Gives the underlying thread 1/10 a second to finish
+        public void JoinThread()
+        {
+            _arenaThread.Join(100);
+        }
+
+        // This is called by the server to dispatch messages to this Arena
+        public void EnqueMessage(NetworkMessage nm)
+        {
+            _messages.Enqueue(nm);
+        }
+
+        #region Network Functions
+        // Sends a packet to a player and marks other info
+        private void _sendTo(PlayerInfo player, Packet packet)
+        {
+            _server.SendPacket(packet, player.Endpoint);
+            player.LastPacketSentTime = DateTime.Now;
+        }
+
+        // Returns true if a player has timed out or not
+        // If we haven't recieved a heartbeat at all from them, they're not timed out
+        private bool _timedOut(PlayerInfo player)
+        {
+            // We haven't recorded it yet
+            if (player.LastPacketReceivedTime == DateTime.MinValue)
+                return false;    
+
+            // Do math
+            bool timeoutDetected = (DateTime.Now > (player.LastPacketReceivedTime.Add(_heartbeatTimeout)));
+            if (timeoutDetected)
+                Console.WriteLine("[{0:000}] Timeout detected on {1} Player at {2}", Id, player.Paddle.Side, _gameTimer.Elapsed);
+
+            return timeoutDetected;
+        }
+
+        // This will Handle the initial connection setup and Heartbeats of a client
+        private void _handleConnectionSetup(PlayerInfo player, NetworkMessage message)
+        {
+            // Make sure the message is from the correct client provided
+            bool sentByPlayer = message.Sender.Equals(player.Endpoint);
+            if (sentByPlayer)
+            {
+                // Record the last time we've heard from them
+                player.LastPacketReceivedTime = message.ReceiveTime;
+
+                // Do they need their Side? or a heartbeat ACK
+                switch (message.Packet.Type)
+                {
+                    case PacketType.RequestJoin:
+                        Console.WriteLine("[{0:000}] Join Request from {1}", Id, player.Endpoint);
+                        _sendAcceptJoin(player);
+                        break;
+
+                    case PacketType.AcceptJoinAck:
+                        // They acknowledged (they will send heartbeats until game start)
+                        player.HavePaddle = true;
+                        break;
+
+                    case PacketType.Heartbeat:
+                        // They are waiting for the game start, Respond with an ACK
+                        HeartbeatAckPacket hap = new HeartbeatAckPacket();
+                        _sendTo(player, hap);
+
+                        // Incase their ACK didn't reach us
+                        if (!player.HavePaddle)
+                            _sendAcceptJoin(player);
+
+                        break;
+                }
+            }
+        }
+
+        // Sends an AcceptJoinPacket to a player
+        public void _sendAcceptJoin(PlayerInfo player)
+        {
+            // They need to know which paddle they are
+            AcceptJoinPacket ajp = new AcceptJoinPacket();
+            ajp.Side = player.Paddle.Side;
+            _sendTo(player, ajp);
+        }
+
+        // Tries to notify the players of a GameStart
+        // retryTimeout is how long to wait until to resending the packet
+        private void _notifyGameStart(PlayerInfo player, TimeSpan retryTimeout)
+        {
+            // check if they are ready already
+            if (player.Ready)
+                return;
+
+            // Make sure not to spam them
+            if (DateTime.Now >= (player.LastPacketSentTime.Add(retryTimeout)))
+            {
+                GameStartPacket gsp = new GameStartPacket();
+                _sendTo(player, gsp);
+            }
+        }
+
+        // Sends information about the current game state to the players
+        // resendTimeout is how long to wait until sending another GameStatePacket
+        private void _sendGameState(PlayerInfo player, TimeSpan resendTimeout)
+        {
+            if (DateTime.Now >= (player.LastPacketSentTime.Add(resendTimeout)))
+            {
+                // Set the data
+                GameStatePacket gsp = new GameStatePacket();
+                gsp.LeftY = LeftPlayer.Paddle.Position.Y;
+                gsp.RightY = RightPlayer.Paddle.Position.Y;
+                gsp.BallPosition = _ball.Position;
+                gsp.LeftScore = LeftPlayer.Paddle.Score;
+                gsp.RightScore = RightPlayer.Paddle.Score;
+
+                _sendTo(player, gsp);
+            }
+        }
+
+        // Tells both of the clients to play a sound effect
+        private void _playSoundEffect(string sfxName)
+        {
+            // Make the packet
+            PlaySoundEffectPacket packet = new PlaySoundEffectPacket();
+            packet.SFXName = sfxName;
+
+            _sendTo(LeftPlayer, packet);
+            _sendTo(RightPlayer, packet);
+        }
+
+        // This updates a paddle's postion from a client
+        // `message.Packet.Type` must be `PacketType.PaddlePosition`
+        // TODO add some "cheat detection,"
+        private void _handlePaddleUpdate(NetworkMessage message)
+        {
+            // Only two possible players
+            PlayerInfo player = message.Sender.Equals(LeftPlayer.Endpoint) ? LeftPlayer : RightPlayer;
+
+            // Make sure we use the latest message **SENT BY THE CLIENT**  ignore it otherwise
+            if (message.Packet.Timestamp > player.LastPacketReceivedTimestamp)
+            {
+                // record timestamp and time
+                player.LastPacketReceivedTimestamp = message.Packet.Timestamp;
+                player.LastPacketReceivedTime = message.ReceiveTime;
+
+                // "cast" the packet and set data
+                PaddlePositionPacket ppp = new PaddlePositionPacket(message.Packet.GetBytes());
+                player.Paddle.Position.Y = ppp.Y;
+            }
+        }
+        #endregion // Network Functions
+
+        #region Collision Methods
+        // Does all of the collision logic for the ball (including scores)
+        private void _checkForBallCollisions()
+        {
+            // Top/Bottom
+            float ballY = _ball.Position.Y;
+            if ((ballY <= _ball.TopmostY) || (ballY >= _ball.BottommostY))
+            {
+                _ball.Speed.Y *= -1;
+                _playSoundEffect("ball-hit");
+            }
+
+            // Ball left and right (the goals!)
+            float ballX = _ball.Position.X;
+            if (ballX <= _ball.LeftmostX)
+            {
+                // Right player scores! (reset ball)
+                RightPlayer.Paddle.Score += 1;
+                Console.WriteLine("[{0:000}] Right Player scored ({1} -- {2}) at {3}",
+                    Id, LeftPlayer.Paddle.Score, RightPlayer.Paddle.Score, _gameTimer.Elapsed);
+                _ball.Initialize();
+                _playSoundEffect("score");
+            }
+            else if (ballX >= _ball.RightmostX)
+            {
+                // Left palyer scores! (reset ball)
+                LeftPlayer.Paddle.Score += 1;
+                Console.WriteLine("[{0:000}] Left Player scored ({1} -- {2}) at {3}",
+                    Id, LeftPlayer.Paddle.Score, RightPlayer.Paddle.Score, _gameTimer.Elapsed);
+                _ball.Initialize();
+                _playSoundEffect("score");
+            }
+
+            // Ball with paddles
+            PaddleCollision collision;
+            if (LeftPlayer.Paddle.Collides(_ball, out collision))
+                _processBallHitWithPaddle(collision);
+            if (RightPlayer.Paddle.Collides(_ball, out collision))
+                _processBallHitWithPaddle(collision);
+            
+        }
+
+        // Modifies the ball state based on what the collision is
+        private void _processBallHitWithPaddle(PaddleCollision collision)
+        {
+            // Safety check
+            if (collision == PaddleCollision.None)
+                return;
+
+            // Increase the speed
+            _ball.Speed.X *= _map((float)_random.NextDouble(), 0, 1, 1, 1.25f);
+            _ball.Speed.Y *= _map((float)_random.NextDouble(), 0, 1, 1, 1.25f);
+
+            // Shoot in the opposite direction
+            _ball.Speed.X *= -1;
+
+            // Hit with top or bottom?
+            if ((collision == PaddleCollision.WithTop) || (collision == PaddleCollision.WithBottom))
+                _ball.Speed.Y *= -1;
+
+            // Play a sound on the client
+            _playSoundEffect("ballHit");
+        }
+        #endregion // Collision Methods
+
+        // Small utility function that maps one value range to another
+        private float _map(float x, float a, float b, float p, float q)
+        {
+            return p + (x - a) * (q - p) / (b - a);
         }
     }
 }
