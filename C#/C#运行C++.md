@@ -1,4 +1,4 @@
-## 1.非托管
+## 1.Windows
 
 1.创建Dynamic-Link Libiary(Dll) 项目
 
@@ -26,9 +26,9 @@ extern "C"
 }
 ```
 
-3.运行环境改为x64，然后build，找到生成的dll
+**3.运行环境改为x64，然后build，找到生成的dll**
 
-4.新建C# Console application，将dll放入bin/debug/net5.0文件夹下
+4.新建C# Console application
 
 5.写入代码
 
@@ -68,7 +68,9 @@ namespace ConsoleApp3
 
 ```
 
-6.运行环境改成x64，运行成功
+6.运行环境改成x64
+
+6.将dll放入bin/x64/debug/net5.0文件夹下，运行成功
 
 参考网址
 
@@ -76,7 +78,43 @@ namespace ConsoleApp3
 2. https://docs.microsoft.com/zh-cn/cpp/build/walkthrough-creating-and-using-a-dynamic-link-library-cpp?view=msvc-160
 3. https://stackoverflow.com/questions/16332701/how-to-call-c-dll-in-c-sharp
 
-## 2.托管
+## 2.Linux
 
+新建linux C++代码
 
+```c++
+#include<iostream>
+using namespace std;
+extern "C" {
+	int JustTest(int a, int b);
+}
+int JustTest(int a, int b) {
+	return a + b;
+}
+```
 
+**注意linux上不需要_declspec(dllexport)**
+
+新增C#代码
+
+```c#
+using System;
+using System.Runtime.InteropServices;
+
+namespace DotnetSelector
+{
+    class Program
+    {
+        [DllImport("test.so", EntryPoint = "JustTest")]
+        static extern int Test(int a, int b);
+
+        static void Main(string[] args)
+        {
+            var c= Test(1,2);
+            Console.WriteLine(c);
+        }
+    }
+}
+```
+
+步骤基本和在windows相同
